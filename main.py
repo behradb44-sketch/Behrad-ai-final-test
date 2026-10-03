@@ -1,61 +1,68 @@
 import os
-import re
-import base64
 import logging
-from typing import Any, Optional
+import base64
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
 from pydantic import BaseModel, Field
 
 
 # =========================================================
-# ENVIRONMENT
+# ENV
 # =========================================================
 
 load_dotenv()
 
 APP_NAME = "BEHRAD AI"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
-CLOUDFLARE_ACCOUNT_ID = os.getenv(
+ACCOUNT_ID = os.getenv(
     "CLOUDFLARE_ACCOUNT_ID",
     ""
 ).strip()
 
-CLOUDFLARE_API_TOKEN = os.getenv(
+API_TOKEN = os.getenv(
     "CLOUDFLARE_API_TOKEN",
     ""
 ).strip()
 
-CLOUDFLARE_CHAT_MODEL = os.getenv(
+CHAT_MODEL = os.getenv(
     "CLOUDFLARE_CHAT_MODEL",
     "@cf/meta/llama-3.1-8b-instruct"
 ).strip()
 
-CLOUDFLARE_IMAGE_MODEL = os.getenv(
+IMAGE_MODEL = os.getenv(
     "CLOUDFLARE_IMAGE_MODEL",
     "@cf/black-forest-labs/flux-1-schnell"
 ).strip()
 
-PORT = int(os.getenv("PORT", "8000"))
-
-BASE_CF_URL = (
-    "https://api.cloudflare.com/client/v4/accounts/"
-    f"{CLOUDFLARE_ACCOUNT_ID}/ai/run"
+PORT = int(
+    os.getenv("PORT", "8000")
 )
 
-CF_CHAT_URL = (
-    f"{BASE_CF_URL}/{CLOUDFLARE_CHAT_MODEL}"
+
+# =========================================================
+# CLOUDFLARE URL
+# =========================================================
+
+CLOUDFLARE_RUN_URL = (
+    "https://api.cloudflare.com/client/v4/"
+    f"accounts/{ACCOUNT_ID}/ai/run"
 )
 
-CF_IMAGE_URL = (
-    f"{BASE_CF_URL}/{CLOUDFLARE_IMAGE_MODEL}"
-)
+
+def model_url(model: str) -> str:
+    return (
+        f"{CLOUDFLARE_RUN_URL}/"
+        f"{model}"
+    )
 
 
 # =========================================================
@@ -67,12 +74,13 @@ logging.basicConfig(
     format=(
         "%(asctime)s | "
         "%(levelname)s | "
-        "%(name)s | "
         "%(message)s"
     ),
 )
 
-logger = logging.getLogger("behrad-ai")
+logger = logging.getLogger(
+    "behrad-ai"
+)
 
 
 # =========================================================
@@ -82,8 +90,6 @@ logger = logging.getLogger("behrad-ai")
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
-    docs_url="/docs",
-    redoc_url="/redoc",
 )
 
 
@@ -97,58 +103,74 @@ app.add_middleware(
 
 
 # =========================================================
-# STATIC FILES
+# STATIC
 # =========================================================
 
-STATIC_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "static",
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
 )
 
+STATIC_DIR = os.path.join(
+    BASE_DIR,
+    "static"
+)
+
+
 if os.path.isdir(STATIC_DIR):
+
     app.mount(
         "/static",
-        StaticFiles(directory=STATIC_DIR),
-        name="static",
+        StaticFiles(
+            directory=STATIC_DIR
+        ),
+        name="static"
     )
 
 
 # =========================================================
-# MODELS
+# DATA MODELS
 # =========================================================
 
-class ChatMessage(BaseModel):
-    role: str = Field(
-        default="user",
-        description="user / assistant / system",
+class Message(BaseModel):
+
+    role: str
+
+    content: str | list[Any]
+
+    image: Any | None = None
+
+    sources: list[Any] = Field(
+        default_factory=list
     )
-    content: str = Field(
-        min_length=1,
-        max_length=20000,
-    )
+
+    chart: Any | None = None
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(
-        min_length=1,
-        max_length=20000,
+
+    # فرانت‌اند فعلی
+    messages: list[Message] = Field(
+        default_factory=list
     )
 
-    history: list[ChatMessage] = Field(
-        default_factory=list,
-    )
+    # برای سازگاری با API قبلی
+    message: str | None = None
+
+    # تنظیمات اختیاری
+    stream: bool = False
 
 
 class ImageRequest(BaseModel):
+
     prompt: str = Field(
         min_length=1,
-        max_length=2048,
+        max_length=4096
     )
 
     steps: int = Field(
         default=4,
         ge=1,
-        le=8,
+        le=8
     )
 
 
@@ -156,180 +178,238 @@ class ImageRequest(BaseModel):
 # HELPERS
 # =========================================================
 
-def cloudflare_configured() -> bool:
+def is_configured() -> bool:
+
     return bool(
-        CLOUDFLARE_ACCOUNT_ID
-        and CLOUDFLARE_API_TOKEN
+        ACCOUNT_ID
+        and API_TOKEN
     )
 
 
-def cloudflare_headers() -> dict[str, str]:
+def headers() -> dict[str, str]:
+
     return {
-        "Authorization": (
-            f"Bearer {CLOUDFLARE_API_TOKEN}"
-        ),
-        "Content-Type": "application/json",
+        "Authorization":
+            f"Bearer {API_TOKEN}",
+
+        "Content-Type":
+            "application/json"
     }
 
 
-def normalize_text(text: str) -> str:
-    text = text.strip()
-
-    # Arabic/Persian normalization
-    replacements = {
-        "ي": "ی",
-        "ى": "ی",
-        "ك": "ک",
-        "ة": "ه",
-        "ۀ": "ه",
-        "\u200c": " ",
-    }
-
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    )
-
-    return text.strip()
-
-
-def looks_like_image_request(text: str) -> bool:
-    """
-    تشخیص ساده درخواست تصویر.
-
-    این تابع قرار نیست جای مدل زبانی را بگیرد؛
-    فقط برای تشخیص سریع درخواست‌های واضح تصویر است.
-    """
-
-    text = normalize_text(text).lower()
-
-    image_words = [
-        "بساز",
-        "ساخت",
-        "ایجاد کن",
-        "تولید کن",
-        "تصویر",
-        "عکس",
-        "عکسی",
-        "عکس بساز",
-        "تصویر بساز",
-        "تصویر ایجاد کن",
-        "تصویر تولید کن",
-        "generate image",
-        "generate a picture",
-        "create image",
-        "create a picture",
-        "make an image",
-        "make a picture",
-        "draw",
-        "draw me",
-    ]
-
-    return any(
-        word in text
-        for word in image_words
-    )
-
-
-def clean_image_prompt(text: str) -> str:
-    """
-    درخواست فارسی کاربر را برای موتور تصویر
-    به یک prompt تمیز تبدیل می‌کند.
-
-    در این نسخه ترجمه به‌صورت جداگانه انجام نمی‌شود.
-    اگر frontend/backend شما قبلاً مترجم دارد،
-    می‌تواند prompt انگلیسی را مستقیماً بفرستد.
-    """
-
-    text = normalize_text(text)
-
-    patterns = [
-        r"^(?:یک|یه)?\s*عکس\s*(?:از)?\s*",
-        r"^(?:یک|یه)?\s*تصویر\s*(?:از)?\s*",
-        r"^(?:عکس|تصویر)\s*بساز\s*(?:از)?\s*",
-        r"^(?:عکس|تصویر)\s*ایجاد\s*کن\s*(?:از)?\s*",
-        r"^(?:عکس|تصویر)\s*تولید\s*کن\s*(?:از)?\s*",
-    ]
-
-    cleaned = text
-
-    for pattern in patterns:
-        cleaned = re.sub(
-            pattern,
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-
-    cleaned = cleaned.strip()
-
-    return cleaned or text
-
-
-def extract_cloudflare_error(
-    response: httpx.Response,
+def extract_error(
+    response: httpx.Response
 ) -> str:
 
     try:
-        data = response.json()
-    except Exception:
-        text = response.text.strip()
 
-        if text:
-            return text[:4000]
+        data = response.json()
+
+    except Exception:
 
         return (
-            f"Cloudflare returned HTTP "
-            f"{response.status_code}"
+            response.text[:4000]
+            or
+            f"HTTP {response.status_code}"
         )
 
-    errors = data.get("errors")
+    errors = data.get(
+        "errors",
+        []
+    )
 
-    if isinstance(errors, list):
+    if isinstance(
+        errors,
+        list
+    ):
+
         messages = []
 
         for error in errors:
-            if isinstance(error, dict):
-                message = error.get("message")
 
-                if message:
+            if isinstance(
+                error,
+                dict
+            ):
+
+                msg = error.get(
+                    "message"
+                )
+
+                if msg:
                     messages.append(
-                        str(message)
+                        str(msg)
                     )
+
             else:
-                messages.append(str(error))
+
+                messages.append(
+                    str(error)
+                )
 
         if messages:
-            return " | ".join(messages)
+
+            return " | ".join(
+                messages
+            )
 
     return str(data)[:4000]
 
 
-def extract_result(data: dict[str, Any]) -> Any:
-    if not data.get("success", False):
-        errors = data.get("errors", [])
+def get_result(
+    data: dict
+) -> Any:
 
-        raise RuntimeError(
-            str(errors)
+    if data.get(
+        "success",
+        False
+    ):
+
+        return data.get(
+            "result"
         )
 
-    return data.get("result")
+    raise RuntimeError(
+        str(
+            data.get(
+                "errors",
+                "Unknown Cloudflare error"
+            )
+        )
+    )
 
 
 # =========================================================
-# CLOUDFLARE IMAGE
+# IMAGE REQUEST DETECTION
+# =========================================================
+
+IMAGE_KEYWORDS = [
+
+    "عکس بساز",
+
+    "تصویر بساز",
+
+    "عکس درست کن",
+
+    "تصویر درست کن",
+
+    "عکس ایجاد کن",
+
+    "تصویر ایجاد کن",
+
+    "عکس تولید کن",
+
+    "تصویر تولید کن",
+
+    "یک عکس بساز",
+
+    "یه عکس بساز",
+
+    "یک تصویر بساز",
+
+    "یه تصویر بساز",
+
+    "generate image",
+
+    "generate a picture",
+
+    "create image",
+
+    "create a picture",
+
+    "make an image",
+
+    "make a picture",
+
+    "draw me",
+
+    "draw a"
+
+]
+
+
+def wants_image(
+    text: str
+) -> bool:
+
+    value = text.strip().lower()
+
+    return any(
+        keyword in value
+        for keyword in IMAGE_KEYWORDS
+    )
+
+
+def image_prompt_from_text(
+    text: str
+) -> str:
+
+    value = text.strip()
+
+    prefixes = [
+
+        "یک عکس بساز",
+
+        "یه عکس بساز",
+
+        "عکس بساز",
+
+        "یک تصویر بساز",
+
+        "یه تصویر بساز",
+
+        "تصویر بساز",
+
+        "عکس درست کن",
+
+        "تصویر درست کن",
+
+        "عکس ایجاد کن",
+
+        "تصویر ایجاد کن",
+
+        "عکس تولید کن",
+
+        "تصویر تولید کن",
+
+        "generate image",
+
+        "create image",
+
+        "create a picture",
+
+        "make an image"
+
+    ]
+
+    lower = value.lower()
+
+    for prefix in prefixes:
+
+        if lower.startswith(
+            prefix.lower()
+        ):
+
+            value = value[
+                len(prefix):
+            ].strip()
+
+            break
+
+    return value or text
+
+
+# =========================================================
+# IMAGE GENERATION
 # =========================================================
 
 async def generate_image(
     prompt: str,
-    steps: int = 4,
+    steps: int = 4
 ) -> str:
 
-    if not cloudflare_configured():
+    if not is_configured():
+
         raise RuntimeError(
             "Cloudflare is not configured."
         )
@@ -337,6 +417,7 @@ async def generate_image(
     prompt = prompt.strip()
 
     if not prompt:
+
         raise RuntimeError(
             "Image prompt is empty."
         )
@@ -344,38 +425,36 @@ async def generate_image(
     steps = max(
         1,
         min(
-            8,
             int(steps),
-        ),
+            8
+        )
     )
 
     # =====================================================
-    # IMPORTANT:
+    # FLUX.1 SCHNELL
     #
-    # FLUX.1 Schnell currently accepts:
-    #   prompt
-    #   steps
-    #
-    # DO NOT send seed / width / height / guidance /
-    # negative_prompt to this model.
+    # مهم:
+    # seed عمداً ارسال نمی‌شود.
     # =====================================================
 
     payload = {
+
         "prompt": prompt,
-        "steps": steps,
+
+        "steps": steps
+
     }
 
     logger.info(
-        "Generating image with model=%s steps=%s",
-        CLOUDFLARE_IMAGE_MODEL,
-        steps,
+        "Generating image: %s",
+        prompt
     )
 
     timeout = httpx.Timeout(
-        connect=20.0,
-        read=180.0,
-        write=30.0,
-        pool=20.0,
+        connect=20,
+        read=180,
+        write=30,
+        pool=20
     )
 
     async with httpx.AsyncClient(
@@ -383,189 +462,258 @@ async def generate_image(
     ) as client:
 
         try:
+
             response = await client.post(
-                CF_IMAGE_URL,
-                headers=cloudflare_headers(),
-                json=payload,
+
+                model_url(
+                    IMAGE_MODEL
+                ),
+
+                headers=headers(),
+
+                json=payload
+
             )
 
         except httpx.TimeoutException:
+
             raise RuntimeError(
-                "Cloudflare image request timed out."
+                "Image generation timed out."
             )
 
         except httpx.RequestError as exc:
-            logger.exception(
-                "Cloudflare connection error"
-            )
 
             raise RuntimeError(
-                f"Cloudflare connection error: {exc}"
+                f"Connection error: {exc}"
             )
 
     if response.status_code >= 400:
-        error = extract_cloudflare_error(
-            response
-        )
-
-        logger.error(
-            "Cloudflare image error: %s",
-            error,
-        )
 
         raise RuntimeError(
-            f"Cloudflare Image Error: {error}"
+            "Cloudflare Image Error: "
+            + extract_error(response)
         )
 
     try:
+
         data = response.json()
 
     except Exception:
+
         raise RuntimeError(
-            "Cloudflare returned invalid JSON."
+            "Invalid Cloudflare response."
         )
 
-    result = extract_result(data)
-
-    if not isinstance(result, dict):
-        raise RuntimeError(
-            "Cloudflare returned an unexpected image result."
-        )
-
-    image_base64 = result.get("image")
-
-    if not image_base64:
-        raise RuntimeError(
-            "Cloudflare returned no image data."
-        )
+    result = get_result(
+        data
+    )
 
     if not isinstance(
-        image_base64,
-        str,
+        result,
+        dict
     ):
+
         raise RuntimeError(
-            "Cloudflare image data is invalid."
+            "Invalid image result."
         )
 
-    # Remove accidental data URI prefix if provider
-    # ever returns one.
-    if image_base64.startswith(
+    image = result.get(
+        "image"
+    )
+
+    if not image:
+
+        raise RuntimeError(
+            "Cloudflare returned no image."
+        )
+
+    if image.startswith(
         "data:image"
     ):
-        return image_base64
+
+        return image
 
     return (
-        "data:image/jpeg;base64,"
-        + image_base64
+        "data:image/png;base64,"
+        + image
     )
 
 
 # =========================================================
-# CLOUDFLARE CHAT
+# CHAT
 # =========================================================
 
 SYSTEM_PROMPT = """
-You are BEHRAD AI.
+تو BEHRAD AI هستی.
 
-You are a helpful general-purpose AI assistant.
+با کاربر طبیعی و دوستانه صحبت کن.
 
-Rules:
-- Answer naturally and clearly.
-- If the user writes Persian, answer Persian.
-- If the user writes English, answer English.
-- Do not mention internal APIs, Cloudflare, models,
-  providers, tokens, prompts, or implementation details
-  unless the user explicitly asks about the technology.
-- Use Markdown when useful.
-- You may use headings, bullet lists, numbered lists,
-  tables and code blocks when appropriate.
-- Do not create fake citations or fake web results.
-- Do not claim that you searched the web unless a real
-  web-search tool was actually used.
-- If the user asks to create an image, the application
-  may handle that request separately.
+اگر کاربر فارسی صحبت می‌کند،
+فارسی جواب بده.
+
+اگر کاربر انگلیسی صحبت می‌کند،
+انگلیسی جواب بده.
+
+لحن فارسی می‌تواند دوستانه و عامیانه باشد،
+ولی واضح و محترمانه بمان.
+
+از Markdown استفاده کن.
+
+وقتی لازم است از این قابلیت‌ها استفاده کن:
+
+- عنوان
+- بولت لیست
+- لیست شماره‌دار
+- جدول
+- کد
+- متن بولد
+
+هیچ‌وقت درباره API، مدل داخلی،
+Cloudflare یا پیاده‌سازی داخلی صحبت نکن،
+مگر اینکه کاربر مستقیماً درباره آن بپرسد.
+
+ادعا نکن که در وب جستجو کرده‌ای،
+مگر اینکه واقعاً ابزار جستجو در اختیار تو باشد.
+
+اگر کاربر از تو درخواست ساخت تصویر کرد،
+سیستم برنامه ممکن است درخواست را به ابزار
+ساخت تصویر ارسال کند.
 """.strip()
 
 
-async def chat_with_cloudflare(
-    message: str,
-    history: list[ChatMessage],
-) -> str:
+def clean_messages(
+    messages: list[Message]
+) -> list[dict[str, str]]:
 
-    if not cloudflare_configured():
-        raise RuntimeError(
-            "Cloudflare is not configured."
-        )
+    cleaned = []
 
-    messages: list[dict[str, str]] = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT,
-        }
-    ]
+    for item in messages:
 
-    # Keep history under a reasonable limit.
-    safe_history = history[-20:]
-
-    for item in safe_history:
-
-        role = item.role.strip().lower()
+        role = item.role.lower().strip()
 
         if role not in {
-            "user",
-            "assistant",
             "system",
+            "user",
+            "assistant"
         }:
-            role = "user"
 
-        content = item.content.strip()
+            continue
+
+        content = item.content
+
+        # اگر content لیست بود
+        if isinstance(
+            content,
+            list
+        ):
+
+            parts = []
+
+            for part in content:
+
+                if isinstance(
+                    part,
+                    dict
+                ):
+
+                    text = part.get(
+                        "text"
+                    )
+
+                    if text:
+                        parts.append(
+                            str(text)
+                        )
+
+            content = "\n".join(
+                parts
+            )
+
+        if not isinstance(
+            content,
+            str
+        ):
+
+            content = str(
+                content
+            )
+
+        content = content.strip()
 
         if not content:
             continue
 
-        messages.append(
-            {
-                "role": role,
-                "content": content,
-            }
+        cleaned.append({
+
+            "role": role,
+
+            "content": content
+
+        })
+
+    return cleaned
+
+
+async def chat(
+    messages: list[dict[str, str]]
+) -> str:
+
+    if not is_configured():
+
+        raise RuntimeError(
+            "Cloudflare is not configured."
         )
 
-    messages.append(
+    # -----------------------------------------------------
+    # محدود کردن history برای جلوگیری از درخواست خیلی
+    # بزرگ
+    # -----------------------------------------------------
+
+    messages = messages[-30:]
+
+    final_messages = [
+
         {
-            "role": "user",
-            "content": message.strip(),
+            "role": "system",
+            "content": SYSTEM_PROMPT
         }
+
+    ]
+
+    final_messages.extend(
+        messages
     )
 
-    # Cloudflare's model-specific REST API accepts the
-    # model input directly. For chat-capable models,
-    # prompt/messages support depends on the selected model.
+    # -----------------------------------------------------
+    # Cloudflare Workers AI
     #
-    # The default below is compatible with the classic
-    # prompt-based instruct model.
-    combined_prompt_parts = []
-
-    for item in messages:
-        combined_prompt_parts.append(
-            f"{item['role'].upper()}: "
-            f"{item['content']}"
-        )
-
-    combined_prompt = "\n\n".join(
-        combined_prompt_parts
-    )
+    # برای مدل‌های متنی مدرن Cloudflare،
+    # messages به صورت رسمی پشتیبانی می‌شود.
+    # -----------------------------------------------------
 
     payload = {
-        "prompt": combined_prompt,
-        "max_tokens": 1200,
-        "temperature": 0.7,
+
+        "messages":
+            final_messages,
+
+        "max_tokens":
+            1500,
+
+        "temperature":
+            0.7
+
     }
 
+    logger.info(
+        "Sending chat request (%d messages)",
+        len(final_messages)
+    )
+
     timeout = httpx.Timeout(
-        connect=20.0,
-        read=120.0,
-        write=30.0,
-        pool=20.0,
+        connect=20,
+        read=120,
+        write=30,
+        pool=20
     )
 
     async with httpx.AsyncClient(
@@ -573,267 +721,432 @@ async def chat_with_cloudflare(
     ) as client:
 
         try:
+
             response = await client.post(
-                CF_CHAT_URL,
-                headers=cloudflare_headers(),
-                json=payload,
+
+                model_url(
+                    CHAT_MODEL
+                ),
+
+                headers=headers(),
+
+                json=payload
+
             )
 
         except httpx.TimeoutException:
+
             raise RuntimeError(
-                "Cloudflare chat request timed out."
+                "AI request timed out."
             )
 
         except httpx.RequestError as exc:
-            logger.exception(
-                "Cloudflare chat connection error"
-            )
 
             raise RuntimeError(
-                f"Cloudflare connection error: {exc}"
+                f"AI connection error: {exc}"
             )
 
     if response.status_code >= 400:
 
-        error = extract_cloudflare_error(
-            response
-        )
-
-        logger.error(
-            "Cloudflare chat error: %s",
-            error,
-        )
-
         raise RuntimeError(
-            f"Cloudflare Chat Error: {error}"
+            "Cloudflare Chat Error: "
+            + extract_error(response)
         )
 
     try:
+
         data = response.json()
 
     except Exception:
+
         raise RuntimeError(
             "Cloudflare returned invalid JSON."
         )
 
-    result = extract_result(data)
+    result = get_result(
+        data
+    )
 
-    if isinstance(result, dict):
+    if isinstance(
+        result,
+        dict
+    ):
 
-        answer = result.get(
+        response_text = result.get(
             "response"
         )
 
-        if isinstance(answer, str):
-            return answer.strip()
+        if isinstance(
+            response_text,
+            str
+        ):
 
-        # Some models may return text instead.
-        for key in (
+            return response_text.strip()
+
+        # بعضی مدل‌ها ممکن است text برگردانند
+
+        for key in [
             "text",
             "output",
-            "generated_text",
-        ):
-            value = result.get(key)
+            "generated_text"
+        ]:
 
-            if isinstance(value, str):
+            value = result.get(
+                key
+            )
+
+            if isinstance(
+                value,
+                str
+            ):
+
                 return value.strip()
 
-    if isinstance(result, str):
+    if isinstance(
+        result,
+        str
+    ):
+
         return result.strip()
 
     raise RuntimeError(
-        "Cloudflare returned an unexpected chat result."
+        "Unexpected AI response."
     )
 
 
 # =========================================================
-# ROUTES
+# HOME
 # =========================================================
 
 @app.get("/")
 async def home():
 
-    index_file = os.path.join(
+    index_path = os.path.join(
         STATIC_DIR,
-        "index.html",
+        "index.html"
     )
 
-    if os.path.isfile(index_file):
+    if os.path.isfile(
+        index_path
+    ):
+
         return FileResponse(
-            index_file
+            index_path
         )
 
-    return JSONResponse(
-        {
-            "service": APP_NAME,
-            "status": "ok",
-            "message": (
-                "BEHRAD AI backend is running."
-            ),
-        }
-    )
+    return {
+
+        "service":
+            APP_NAME,
+
+        "version":
+            APP_VERSION,
+
+        "status":
+            "ok"
+
+    }
 
 
-@app.get("/api/health")
+# =========================================================
+# HEALTH
+# =========================================================
+
+@app.get(
+    "/api/health"
+)
 async def health():
 
     return {
-        "service": APP_NAME,
-        "version": APP_VERSION,
-        "status": "ok",
-        "provider": "Cloudflare Workers AI",
-        "chat_model": CLOUDFLARE_CHAT_MODEL,
-        "image_model": CLOUDFLARE_IMAGE_MODEL,
-        "cloudflare_configured": (
-            cloudflare_configured()
-        ),
-    }
 
+        "service":
+            APP_NAME,
 
-@app.get("/api/test")
-async def test():
+        "version":
+            APP_VERSION,
 
-    return {
-        "ok": True,
-        "service": APP_NAME,
-        "version": APP_VERSION,
+        "status":
+            "ok",
+
+        "provider":
+            "Cloudflare Workers AI",
+
+        "chat_model":
+            CHAT_MODEL,
+
+        "image_model":
+            IMAGE_MODEL,
+
+        "cloudflare_configured":
+            is_configured()
+
     }
 
 
 # =========================================================
-# IMAGE ENDPOINT
+# IMAGE API
 # =========================================================
 
-@app.post("/api/generate-image")
-async def api_generate_image(
-    request: ImageRequest,
+@app.post(
+    "/api/generate-image"
+)
+async def generate_image_api(
+    request: ImageRequest
 ):
 
     try:
 
         image = await generate_image(
+
             prompt=request.prompt,
-            steps=request.steps,
+
+            steps=request.steps
+
         )
 
         return {
-            "success": True,
-            "image": image,
-            "prompt": request.prompt,
+
+            "success":
+                True,
+
+            "type":
+                "image",
+
+            "image":
+                image,
+
+            "prompt":
+                request.prompt
+
         }
 
     except RuntimeError as exc:
 
         logger.error(
-            "Image generation failed: %s",
-            exc,
+            "Image error: %s",
+            exc
         )
 
         raise HTTPException(
+
             status_code=502,
-            detail=str(exc),
+
+            detail=str(exc)
+
         )
 
-    except Exception as exc:
+    except Exception:
 
         logger.exception(
-            "Unexpected image generation error"
+            "Unexpected image error"
         )
 
         raise HTTPException(
+
             status_code=500,
+
             detail=(
                 "Unexpected image generation error."
-            ),
+            )
+
         )
 
 
 # =========================================================
-# CHAT ENDPOINT
+# CHAT API
 # =========================================================
 
-@app.post("/api/chat")
-async def api_chat(
-    request: ChatRequest,
+@app.post(
+    "/api/chat"
+)
+async def chat_api(
+    request: ChatRequest
 ):
 
-    message = request.message.strip()
+    # =====================================================
+    # سازگاری با هر دو فرمت:
+    #
+    # جدید:
+    # {
+    #   "messages": [...]
+    # }
+    #
+    # قدیمی:
+    # {
+    #   "message": "سلام"
+    # }
+    # =====================================================
 
-    if not message:
+    messages = clean_messages(
+        request.messages
+    )
+
+    if request.message:
+
+        messages.append({
+
+            "role":
+                "user",
+
+            "content":
+                request.message.strip()
+
+        })
+
+    if not messages:
+
         raise HTTPException(
+
             status_code=400,
-            detail="Message cannot be empty.",
+
+            detail=(
+                "No message was provided."
+            )
+
         )
 
-    # -----------------------------------------------------
-    # IMAGE REQUEST DETECTION
-    # -----------------------------------------------------
+    # آخرین پیام واقعی کاربر
+    user_message = None
 
-    if looks_like_image_request(message):
+    for item in reversed(
+        messages
+    ):
 
-        image_prompt = clean_image_prompt(
-            message
+        if item["role"] == "user":
+
+            user_message = item[
+                "content"
+            ]
+
+            break
+
+    # =====================================================
+    # IMAGE REQUEST
+    # =====================================================
+
+    if (
+        user_message
+        and
+        wants_image(
+            user_message
+        )
+    ):
+
+        image_prompt = (
+            image_prompt_from_text(
+                user_message
+            )
         )
 
         try:
 
             image = await generate_image(
+
                 prompt=image_prompt,
-                steps=4,
+
+                steps=4
+
             )
 
             return {
-                "success": True,
-                "type": "image",
-                "message": (
-                    "تصویرت آماده شد."
-                ),
-                "image": image,
-                "prompt": image_prompt,
+
+                "success":
+                    True,
+
+                "type":
+                    "image",
+
+                "message":
+                    "تصویرت آماده شد 😎",
+
+                "image":
+                    image,
+
+                "prompt":
+                    image_prompt,
+
+                "sources":
+                    [],
+
+                "chart":
+                    None
+
             }
 
         except RuntimeError as exc:
 
             logger.error(
-                "Automatic image generation failed: %s",
-                exc,
+                "Automatic image error: %s",
+                exc
             )
 
-            # We intentionally return a normal chat-style
-            # error rather than crashing the application.
             return {
-                "success": False,
-                "type": "error",
-                "message": str(exc),
+
+                "success":
+                    False,
+
+                "type":
+                    "error",
+
+                "message":
+                    str(exc),
+
+                "image":
+                    None,
+
+                "sources":
+                    [],
+
+                "chart":
+                    None
+
             }
 
-    # -----------------------------------------------------
+    # =====================================================
     # NORMAL CHAT
-    # -----------------------------------------------------
+    # =====================================================
 
     try:
 
-        answer = await chat_with_cloudflare(
-            message=message,
-            history=request.history,
+        answer = await chat(
+            messages
         )
 
         return {
-            "success": True,
-            "type": "text",
-            "message": answer,
+
+            "success":
+                True,
+
+            "type":
+                "text",
+
+            "message":
+                answer,
+
+            "image":
+                None,
+
+            "sources":
+                [],
+
+            "chart":
+                None
+
         }
 
     except RuntimeError as exc:
 
         logger.error(
-            "Chat failed: %s",
-            exc,
+            "Chat error: %s",
+            exc
         )
 
         raise HTTPException(
+
             status_code=502,
-            detail=str(exc),
+
+            detail=str(exc)
+
         )
 
     except Exception:
@@ -843,47 +1156,45 @@ async def api_chat(
         )
 
         raise HTTPException(
+
             status_code=500,
+
             detail=(
                 "Unexpected AI error."
-            ),
+            )
+
         )
 
 
 # =========================================================
-# ERROR HANDLERS
+# 404
 # =========================================================
 
 @app.exception_handler(404)
-async def not_found_handler(
+async def not_found(
     request,
-    exc,
+    exc
 ):
+
     return JSONResponse(
+
         status_code=404,
-        content={
-            "success": False,
-            "error": "Not found",
-        },
-    )
 
-
-@app.exception_handler(500)
-async def server_error_handler(
-    request,
-    exc,
-):
-    return JSONResponse(
-        status_code=500,
         content={
-            "success": False,
-            "error": "Internal server error",
-        },
+
+            "success":
+                False,
+
+            "error":
+                "Not found"
+
+        }
+
     )
 
 
 # =========================================================
-# LOCAL DEVELOPMENT
+# START
 # =========================================================
 
 if __name__ == "__main__":
@@ -891,8 +1202,13 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
+
         "main:app",
+
         host="0.0.0.0",
+
         port=PORT,
-        reload=False,
+
+        reload=False
+
             )
